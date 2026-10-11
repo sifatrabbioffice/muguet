@@ -27,20 +27,19 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          brew install xcodegen p7zip
+          brew install xcodegen
 
-      - name: Download and Convert Archive
+      - name: Download and Rename Rar to Game Zip
         run: |
           curl -L "${{ github.event.inputs.game_rar_url }}" -o mirror.rar
-          # Extract rar file
-          7z x mirror.rar -oextracted_game
-          
-          # Repackage into game.zip as expected by the build script
-          cd extracted_game
-          # Find the folder containing data/ and b/ or zip it directly
-          zip -r ../game.zip .
-          cd ..
+          mv mirror.rar game.zip
           ls -lh game.zip
+
+      - name: Fix Xcode Project Format
+        run: |
+          cd ios
+          xcodegen generate
+          cd ..
 
       - name: Build Unsigned IPA
         run: |
