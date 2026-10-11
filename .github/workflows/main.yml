@@ -31,7 +31,7 @@ jobs:
 
       - name: Download Game Zip
         run: |
-          curl -L "${{ github.event.inputs.game_zip_url }}" -o game.zip
+          curl -L "${{ github.event.inputs.game_zip_url }}" -o mirror.rar
           ls -lh mirror.rar
 
       - name: Build Unsigned IPA
@@ -40,7 +40,7 @@ jobs:
           chmod +x make-ios.sh
           
           # Unsigned IPA জেনারেট করার জন্য ফ্রি ফ্ল্যাগ সহ বিল্ড রান
-          FREE=1 CODE_SIGNING_ALLOWED=NO ./make-ios.sh game.zip --ipa
+          FREE=1 CODE_SIGNING_ALLOWED=NO ./make-ios.sh mirror.rar --ipa
 
       - name: Prepare Unsigned IPA Package
         run: |
