@@ -1,4 +1,4 @@
-name: Gofile Link Fetcher & Action
+name: Gofile Browser Extractor
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         default: 'https://gofile.io/d/pA901JJr'
 
 jobs:
-  process-link:
+  extract-link:
     runs-on: ubuntu-latest
 
     steps:
@@ -21,33 +21,52 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies
+      - name: Install Playwright & Dependencies
         run: |
-          pip install requests
+          pip install playwright
+          playwright install --with-deps chromium
 
-      - name: Fetch and Extract Download Link
+      - name: Run Browser Automation to Grab Link
         env:
-          GOFILE_URL: ${{ github.event.inputs.gofile_url || 'https://gofile.io/d/pA901JJr' }}
+          GOFILE_URL: ${{ github.event.inputs.gofile_url }}
         run: |
           python3 -c "
-          import requests, re
+          import asyncio
+          from playwright.async_api import async_playwright
+          import os
 
-          url = '${{ github.event.inputs.gofile_url }}'
-          print(f'Target URL: {url}')
-          
-          # Extract content ID from gofile URL
-          match = re.search(r'/d/([a-zA-Z0-9]+)', url)
-          if match:
-              content_id = match.group(1)
-              print(f'Content ID: {content_id}')
-              
-              # Gofile API usually requires token/content lookup
-              api_url = f'https://api.gofile.io/contents/{content_id}'
-              headers = {'User-Agent': 'Mozilla/5.0'}
-              
-              response = requests.get(api_url, headers=headers)
-              print(f'API Status: {response.status_code}')
-              print(f'API Response: {response.text}')
-          else:
-              print('Invalid Gofile URL format.')
+          async def main():
+              url = os.environ.get('GOFILE_URL')
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  page = await browser.new_page()
+                  
+                  print(f'Opening: {url}')
+                  await page.goto(url, wait_until='networkidle')
+                  
+                  # Wait for download/content elements to load
+                  await asyncio.sleep(5)
+                  
+                  # Capture all resource requests or links
+                  links = []
+                  page.on('request', lambda request: links.append(request.url))
+                  
+                  # Try clicking the download button if present
+                  try:
+                      download_btn = page.locator('button:has-text(\"Download\")').first
+                      if await download_btn.count() > 0:
+                          await download_btn.click()
+                          await asyncio.sleep(3)
+                  except Exception as e:
+                      print(f'Click error: {e}')
+
+                  # Print captured file links
+                  print('--- Captured Direct Links ---')
+                  for l in links:
+                      if any(ext in l for ext in ['.zip', '.rar', '.7z', '.mp4', '.mkv', 'download']):
+                          print(l)
+
+                  await browser.close()
+
+          asyncio.run(main())
           "
