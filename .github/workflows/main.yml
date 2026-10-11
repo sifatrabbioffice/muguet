@@ -1,0 +1,62 @@
+name: Build Unsigned iOS IPA (Muguet)
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_zip_url:
+        description: 'Direct Download URL for game.zip (WASM/Data zip)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          repository: 'c22dev/muguet'
+          submodules: recursive
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.98.1'
+          targets: 'aarch64-apple-ios'
+
+      - name: Install Dependencies
+        run: |
+          brew install xcodegen
+
+      - name: Download Game Zip
+        run: |
+          curl -L "${{ github.event.inputs.game_zip_url }}" -o game.zip
+          ls -lh game.zip
+
+      - name: Build Unsigned IPA
+        run: |
+          # make-ios.sh চালানোর আগে এক্সিকিউট পারমিশন প্রদান
+          chmod +x make-ios.sh
+          
+          # Unsigned IPA জেনারেট করার জন্য ফ্রি ফ্ল্যাগ সহ বিল্ড রান
+          FREE=1 CODE_SIGNING_ALLOWED=NO ./make-ios.sh game.zip --ipa
+
+      - name: Prepare Unsigned IPA Package
+        run: |
+          mkdir -p output
+          if [ -d "build/Muguet.app" ]; then
+            mkdir -p output/Payload
+            cp -r build/Muguet.app output/Payload/
+            cd output
+            zip -r Muguet-Unsigned.ipa Payload
+            cd ..
+          elif [ -f "build/Muguet.ipa" ]; then
+            cp build/Muguet.ipa output/Muguet-Unsigned.ipa
+          fi
+
+      - name: Upload Unsigned IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Muguet-Unsigned-IPA
+          path: output/Muguet-Unsigned.ipa
