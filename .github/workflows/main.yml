@@ -32,7 +32,7 @@ jobs:
       - name: Download Game Zip
         run: |
           curl -L "${{ github.event.inputs.game_zip_url }}" -o game.zip
-          ls -lh game.zip
+          ls -lh mirror.rar
 
       - name: Build Unsigned IPA
         run: |
