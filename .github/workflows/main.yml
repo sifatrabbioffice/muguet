@@ -3,8 +3,8 @@ name: Build Unsigned iOS IPA (Muguet)
 on:
   workflow_dispatch:
     inputs:
-      game_zip_url:
-        description: 'Direct Download URL for game.zip (WASM/Data zip)'
+      game_rar_url:
+        description: 'Direct Download URL for mirror.rar'
         required: true
         type: string
 
@@ -27,20 +27,25 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          brew install xcodegen
+          brew install xcodegen p7zip
 
-      - name: Download Game Zip
+      - name: Download and Convert Archive
         run: |
-          curl -L "${{ github.event.inputs.game_zip_url }}" -o mirror.rar
-          ls -lh mirror.rar
+          curl -L "${{ github.event.inputs.game_rar_url }}" -o mirror.rar
+          # Extract rar file
+          7z x mirror.rar -oextracted_game
+          
+          # Repackage into game.zip as expected by the build script
+          cd extracted_game
+          # Find the folder containing data/ and b/ or zip it directly
+          zip -r ../game.zip .
+          cd ..
+          ls -lh game.zip
 
       - name: Build Unsigned IPA
         run: |
-          # make-ios.sh চালানোর আগে এক্সিকিউট পারমিশন প্রদান
           chmod +x make-ios.sh
-          
-          # Unsigned IPA জেনারেট করার জন্য ফ্রি ফ্ল্যাগ সহ বিল্ড রান
-          FREE=1 CODE_SIGNING_ALLOWED=NO ./make-ios.sh mirror.rar --ipa
+          FREE=1 CODE_SIGNING_ALLOWED=NO ./make-ios.sh game.zip --ipa
 
       - name: Prepare Unsigned IPA Package
         run: |
