@@ -1,32 +1,23 @@
-name: Gofile Direct Downloader
+name: Gofile Link Extractor
 on:
   workflow_dispatch:
 
 jobs:
-  download:
+  get-link:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Fetch Gofile and Download
+      - name: Fetch Gofile Direct Link
         run: |
-          # Guest token generate kora
+          # Guest account token generate kora
           TOKEN=$(curl -s -X POST "https://api.gofile.io/accounts" | jq -r '.data.token')
-          echo "Token: $TOKEN"
+          echo "Generated Token successfully."
           
-          # File ID and details fetch kora
+          # Content details fetch kora
           FILE_ID="07e3192f-cdef-47c1-a8ec-e79f3bfd6330"
           RESPONSE=$(curl -s "https://api.gofile.io/contents/$FILE_ID?wt=4fd6sg8h3s6d-s&token=$TOKEN")
-          echo "$RESPONSE" | jq '.'
           
           # Direct download link extraction
           DL_LINK=$(echo "$RESPONSE" | jq -r '.data.link')
+          echo "=========================================="
           echo "Direct Download Link: $DL_LINK"
-          
-          if [ "$DL_LINK" != "null" ]; then
-            echo "Downloading file..."
-            curl -L -H "Authorization: Bearer $TOKEN" "$DL_LINK" -o "mirror.rar"
-          else
-            echo "Direct link could not be fetched due to API restriction."
-          fi
+          echo "=========================================="
