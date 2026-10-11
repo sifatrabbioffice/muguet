@@ -1,26 +1,26 @@
-name: Get Gofile Direct Link
-
+name: Gofile Direct Fetch
 on:
   workflow_dispatch:
-    inputs:
-      gofile_url:
-        description: 'Gofile URL'
-        required: true
-        default: 'https://gofile.io/d/pA901JJr'
 
 jobs:
-  extract:
+  fetch-file:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch Gofile Direct Link
+      - name: Get Guest Token
+        id: get_token
         run: |
-          URL="${{ github.event.inputs.gofile_url }}"
-          CONTENT_ID=$(echo "$URL" | awk -F'/' '{print $NF}')
+          TOKEN=$(curl -s -X POST "https://api.gofile.io/accounts" | jq -r '.data.token')
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Fetch File Direct Link
+        env:
+          TOKEN: ${{ steps.get_token.outputs.token }}
+        run: |
+          FILE_ID="07e3192f-cdef-47c1-a8ec-e79f3bfd6330"
+          CONTENT=$(curl -s "https://api.gofile.io/contents/$FILE_ID?wt=4fd6sg8h3s6d-s&token=$TOKEN")
+          echo "Content Response:"
+          echo $CONTENT | jq '.'
           
-          echo "Content ID: $CONTENT_ID"
-          
-          # Gofile API Call to fetch content details
-          RESPONSE=$(curl -s "https://api.gofile.io/contents/$CONTENT_ID")
-          
-          echo "API Response:"
-          echo "$RESPONSE" | jq .
+          # Direct download link extract korar jonno
+          DL_LINK=$(echo $CONTENT | jq -r '.data.link')
+          echo "Direct Download Link: $DL_LINK"
