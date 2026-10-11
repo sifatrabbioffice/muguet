@@ -1,0 +1,26 @@
+name: Get Gofile Direct Link
+
+on:
+  workflow_dispatch:
+    inputs:
+      gofile_url:
+        description: 'Gofile URL'
+        required: true
+        default: 'https://gofile.io/d/pA901JJr'
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Gofile Direct Link
+        run: |
+          URL="${{ github.event.inputs.gofile_url }}"
+          CONTENT_ID=$(echo "$URL" | awk -F'/' '{print $NF}')
+          
+          echo "Content ID: $CONTENT_ID"
+          
+          # Gofile API Call to fetch content details
+          RESPONSE=$(curl -s "https://api.gofile.io/contents/$CONTENT_ID")
+          
+          echo "API Response:"
+          echo "$RESPONSE" | jq .
