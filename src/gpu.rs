@@ -5,12 +5,14 @@ use crate::mem_base_len;
 use regex::Regex;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use wasmtime::SharedMemory;
+use wgpu::util::DeviceExt;
 use wgpu::*;
 
 const RING_DATA: u64 = 64;
@@ -21,6 +23,7 @@ const BIND_UAV: u32 = 0x80;
 const RING_CHUNK: u64 = 8 << 20;
 const UBO_WINDOW: u64 = 65536;
 const FRAME_SLOTS: usize = 3;
+const PIPELINE_WAIT: Duration = Duration::from_millis(8);
 const ZERO_VB_SIZE: u64 = 4096;
 const OCCLUSION_CAPACITY: u32 = 2048;
 const OCCLUSION_VISIBLE_COUNT: u64 = 65536;
@@ -91,7 +94,9 @@ struct Fmt {
 }
 
 static BC_SOFT: AtomicBool = AtomicBool::new(false);
+static BC1_ASTC: AtomicBool = AtomicBool::new(false);
 static F32_HALF: AtomicBool = AtomicBool::new(false);
+static MEM_STATS: LazyLock<bool> = LazyLock::new(|| std::env::var("MUGUET_MEM_STATS").is_ok_and(|v| v != "0"));
 static RE_VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@binding\((\d+)u?\)\s*var(?:<[^>]*>)?\s+(\w+)").unwrap());
 static RE_IDENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w+").unwrap());
 
@@ -149,48 +154,69 @@ fn bc_soft_format(f: TextureFormat) -> TextureFormat {
 }
 
 fn bc_decode(bc: TextureFormat, src: &[u8], bpr: u32, rows: u32, layers: u32, w: u32, h: u32) -> (Vec<u8>, u32) {
-    use TextureFormat as T;
+    static CORES: LazyLock<usize> = LazyLock::new(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
     let px = bc_soft_format(bc).block_copy_size(None).unwrap_or(4) as usize;
-    let block = bc.block_copy_size(None).unwrap_or(16) as usize;
-    let (bw, bh) = (w.div_ceil(4) as usize, h.div_ceil(4) as usize);
     let (w, h) = (w as usize, h as usize);
     let mut out = vec![0u8; w * h * px * layers as usize];
-    let mut tmp = [0u8; 4 * 4 * 8];
-    let mut half = [0u16; 4 * 4 * 3];
-    for l in 0..layers as usize {
-        for by in 0..bh {
-            for bx in 0..bw {
-                let o = (l * rows as usize + by) * bpr as usize + bx * block;
-                let Some(b) = src.get(o..o + block) else { continue };
-                match bc {
-                    T::Bc1RgbaUnorm | T::Bc1RgbaUnormSrgb => bcdec_rs::bc1(b, &mut tmp, 16),
-                    T::Bc2RgbaUnorm | T::Bc2RgbaUnormSrgb => bcdec_rs::bc2(b, &mut tmp, 16),
-                    T::Bc3RgbaUnorm | T::Bc3RgbaUnormSrgb => bcdec_rs::bc3(b, &mut tmp, 16),
-                    T::Bc4RUnorm => bcdec_rs::bc4(b, &mut tmp, 4, false),
-                    T::Bc5RgUnorm => bcdec_rs::bc5(b, &mut tmp, 8, false),
-                    T::Bc6hRgbUfloat => {
-                        bcdec_rs::bc6h_half(b, &mut half, 12, false);
-                        for i in 0..16 {
-                            for c in 0..4 {
-                                let v = if c < 3 { half[i * 3 + c] } else { 0x3c00 };
-                                tmp[i * 8 + c * 2..i * 8 + c * 2 + 2].copy_from_slice(&v.to_le_bytes());
-                            }
-                        }
-                    }
-                    _ => bcdec_rs::bc7(b, &mut tmp, 16),
-                }
-                for r in 0..4 {
-                    let y = by * 4 + r;
-                    if y >= h { break; }
-                    let n = (w - bx * 4).min(4) * px;
-                    let d = ((l * h + y) * w + bx * 4) * px;
-                    out[d..d + n].copy_from_slice(&tmp[r * 4 * px..r * 4 * px + n]);
-                }
+    if out.is_empty() {
+        return (out, (w * px) as u32);
+    }
+    let mut jobs: Vec<(usize, usize, &mut [u8])> = out
+        .chunks_mut(w * h * px)
+        .enumerate()
+        .flat_map(|(l, layer)| layer.chunks_mut(4 * w * px).enumerate().map(move |(by, d)| (l, by, d)))
+        .collect();
+    let threads = if w * h * px * layers as usize >= 1 << 20 { (*CORES).min(jobs.len()) } else { 1 };
+    if threads <= 1 {
+        for (l, by, d) in jobs.iter_mut() { bc_decode_row(bc, src, bpr, rows, *l, *by, w, px, d); }
+    } else {
+        let n = jobs.len();
+        let mut groups: Vec<Vec<(usize, usize, &mut [u8])>> = (0..threads).map(|_| Vec::new()).collect();
+        for (i, job) in jobs.drain(..).enumerate() { groups[i * threads / n].push(job); }
+        std::thread::scope(|sc| {
+            for group in groups {
+                sc.spawn(move || for (l, by, d) in group { bc_decode_row(bc, src, bpr, rows, l, by, w, px, d); });
             }
-        }
+        });
     }
     (out, (w * px) as u32)
 }
+
+#[allow(clippy::too_many_arguments)]
+fn bc_decode_row(bc: TextureFormat, src: &[u8], bpr: u32, rows: u32, l: usize, by: usize, w: usize, px: usize, dst: &mut [u8]) {
+    use TextureFormat as T;
+    let block = bc.block_copy_size(None).unwrap_or(16) as usize;
+    let lines = dst.len() / (w * px);
+    let mut tmp = [0u8; 4 * 4 * 8];
+    let mut half = [0u16; 4 * 4 * 3];
+    for bx in 0..w.div_ceil(4) {
+        let o = (l * rows as usize + by) * bpr as usize + bx * block;
+        let Some(b) = src.get(o..o + block) else { continue };
+        match bc {
+            T::Bc1RgbaUnorm | T::Bc1RgbaUnormSrgb => bcdec_rs::bc1(b, &mut tmp, 16),
+            T::Bc2RgbaUnorm | T::Bc2RgbaUnormSrgb => bcdec_rs::bc2(b, &mut tmp, 16),
+            T::Bc3RgbaUnorm | T::Bc3RgbaUnormSrgb => bcdec_rs::bc3(b, &mut tmp, 16),
+            T::Bc4RUnorm => bcdec_rs::bc4(b, &mut tmp, 4, false),
+            T::Bc5RgUnorm => bcdec_rs::bc5(b, &mut tmp, 8, false),
+            T::Bc6hRgbUfloat => {
+                bcdec_rs::bc6h_half(b, &mut half, 12, false);
+                for i in 0..16 {
+                    for c in 0..4 {
+                        let v = if c < 3 { half[i * 3 + c] } else { 0x3c00 };
+                        tmp[i * 8 + c * 2..i * 8 + c * 2 + 2].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+            _ => bcdec_rs::bc7(b, &mut tmp, 16),
+        }
+        for r in 0..lines.min(4) {
+            let n = (w - bx * 4).min(4) * px;
+            let d = (r * w + bx * 4) * px;
+            dst[d..d + n].copy_from_slice(&tmp[r * 4 * px..r * 4 * px + n]);
+        }
+    }
+}
+
 fn map_format(f: u32, bind: u32) -> Fmt {
     use TextureFormat as T;
     let ds = bind & BIND_DS != 0;
@@ -526,7 +552,7 @@ fn remap_locations(text: &str, vs: bool, map: &HashMap<u32, u32>) -> String {
 static RE_LOC_U: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@location\((\d+)(u?)\)").unwrap());
 
 #[derive(Clone, Copy)]
-struct TexDesc { w: u32, h: u32, d: u32, mips: u32, samples: u32, dim: TextureDimension }
+struct TexDesc { w: u32, h: u32, d: u32, mips: u32, samples: u32, dim: TextureDimension, skip: u32 }
 struct Proxy {
     tex: Texture,
     format: TextureFormat,
@@ -549,6 +575,7 @@ struct Tex {
     proxy_half: Option<Proxy>,
     blit_bg: Option<BindGroup>,
     mip_passes: Option<Vec<(TextureView, BindGroup)>>,
+    astc: bool,
 }
 struct Buf {
     size: u64,
@@ -743,17 +770,23 @@ enum MapKind {
     Occlusion { list: Vec<(u64, u32, u64, bool, usize)> },
 }
 
+struct AstcJob { tex_id: u32, tex: Texture, mip: u32, origin: Origin3d, bx: u32, by: u32, layers: u32, dst_row: u32, src_word: u32, dst_byte: u64, first_block: u32 }
+
 pub struct Gpu {
     mem: SharedMemory,
     base: *mut u8,
     ring: u64,
     device: Device,
     queue: Queue,
+    live_queries: std::collections::HashSet<u64>,
+    query_done: Arc<Mutex<Vec<(u64, u64, u32)>>>,
+    stale_query_writes: u64,
+    bc_live: HashMap<u32, (TextureFormat, u64, u64)>,
     adapter: Adapter,
     surface: Option<(Surface<'static>, Arc<winit::window::Window>)>,
     surface_format: TextureFormat,
     surface_size: (u32, u32),
-    objs: Vec<Option<Obj>>,
+    objs: Vec<Option<Box<Obj>>>,
     enc: Option<CommandEncoder>,
     enc_epoch: u64,
     pass: Option<RenderPass<'static>>,
@@ -765,17 +798,19 @@ pub struct Gpu {
     last_pl: Option<Rc<Pl>>,
     shader_index: HashMap<String, serde_json::Value>,
     shader_dir: PathBuf,
+    map_programs: HashMap<String, Rc<Program>>,
     next_uid: u64,
-    bgl_cache: HashMap<(String, u32, u32), (BindGroupLayout, u64)>,
+    bgl_cache: FxHashMap<(u64, u128, u32, u32), (BindGroupLayout, u64)>,
     empty_bgl: Option<(BindGroupLayout, u64)>,
-    pipelines: HashMap<Vec<i64>, PipeEntry>,
+    pipelines: FxHashMap<Vec<i64>, PipeEntry>,
     pipe_jobs: Option<std::sync::mpsc::Sender<(u64, PipeJob)>>,
     pipe_results: std::sync::mpsc::Receiver<(u64, Option<RenderPipeline>)>,
     pipe_pending: HashMap<u64, (Vec<i64>, Vec<VbReq>, String)>,
     pending_skips: u64,
     pending_skips0: u64,
+    pipe_wait_left: Duration,
     compute: HashMap<String, Option<(ComputePipeline, BindGroupLayout, u64, Rc<Program>)>>,
-    bind_groups: HashMap<Vec<u64>, (BindGroup, u64)>,
+    bind_groups: FxHashMap<Vec<u64>, (BindGroup, u64)>,
     ubo_slots: Vec<Vec<Chunk>>,
     ubo_shared: Vec<(Buffer, u64)>,
     ubo_slot: usize,
@@ -792,6 +827,13 @@ pub struct Gpu {
     unfilt: HashMap<u64, (u128, u128)>,
     nearest: HashMap<u32, Sampler>,
     f2d_pipeline: Option<RenderPipeline>,
+    bc1_astc: Option<ComputePipeline>,
+    astc_jobs: Vec<AstcJob>,
+    astc_src: Vec<u8>,
+    astc_dst_bytes: u64,
+    astc_blocks: u32,
+    astc_pending: std::collections::HashSet<u32>,
+    astc_in_encoder: u32,
     blit: Option<RenderPipeline>,
     mip_pipelines: HashMap<TextureFormat, RenderPipeline>,
     mip_sampler: Option<Sampler>,
@@ -859,15 +901,19 @@ impl Gpu {
             | Features::FLOAT32_FILTERABLE | Features::INDIRECT_FIRST_INSTANCE | Features::RG11B10UFLOAT_RENDERABLE
             | Features::BGRA8UNORM_STORAGE | Features::DEPTH_CLIP_CONTROL | Features::CLIP_DISTANCES | Features::DUAL_SOURCE_BLENDING
 
-            | Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+            | Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES | Features::TEXTURE_COMPRESSION_ASTC;
         let features = want & adapter.features();
         if !features.contains(Features::FLOAT32_FILTERABLE) {
             F32_HALF.store(true, Ordering::Relaxed);
             log("this GPU can't filter 32-bit float textures: sampling them as 16-bit");
         }
-        if !features.contains(Features::TEXTURE_COMPRESSION_BC) {
+        if !features.contains(Features::TEXTURE_COMPRESSION_BC) || std::env::var_os("MUGUET_SOFT_BC").is_some() {
             BC_SOFT.store(true, Ordering::Relaxed);
             log("this GPU can't read BC textures: decoding them on the CPU");
+            if features.contains(Features::TEXTURE_COMPRESSION_ASTC) && std::env::var_os("MUGUET_NO_ASTC").is_none() {
+                BC1_ASTC.store(true, Ordering::Relaxed);
+                log("BC1 textures are transcoded to ASTC 4x4 on the GPU");
+            }
         }
         let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
             label: Some("muguet"),
@@ -892,6 +938,7 @@ impl Gpu {
                     log(&format!("validation error: {}", &msg[..msg.len().min(900)]));
                 }
             }));
+            device.set_device_lost_callback(|reason, message| log(&format!("GPU device lost ({reason:?}): {message}")));
         }
         let info = adapter.get_info();
         log(&format!("device ready: {} ({:?}), features {:?}", info.name, info.backend, features));
@@ -926,14 +973,15 @@ impl Gpu {
             Some(job_tx)
         };
         Ok(Gpu {
-            instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0,
+            live_queries: Default::default(), query_done: Default::default(), stale_query_writes: 0, bc_live: HashMap::new(),
+            instance: instance.clone(), pending_clears: HashMap::new(), clears_folded: 0, pipe_jobs, pipe_results, pipe_pending: HashMap::new(), pending_skips: 0, pending_skips0: 0, pipe_wait_left: PIPELINE_WAIT,
             base, mem, ring, device, queue, adapter, surface, surface_format, surface_size: (0, 0),
             objs: Vec::new(), enc: None, enc_epoch: 1, pass: None, pass_key: None, pass_info: None, pass_st: PassSt::default(),
-            s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
-            bgl_cache: HashMap::new(), empty_bgl: None, pipelines: HashMap::new(), compute: HashMap::new(), bind_groups: HashMap::new(),
+            map_programs: HashMap::new(), s: State::new(), pdirty: true, last_pl: None, shader_index, shader_dir, next_uid: 1,
+            bgl_cache: FxHashMap::default(), empty_bgl: None, pipelines: FxHashMap::default(), compute: HashMap::new(), bind_groups: FxHashMap::default(),
             ubo_slots: (0..FRAME_SLOTS).map(|_| Vec::new()).collect(), ubo_shared: Vec::new(), ubo_slot: 0, ubo_chunk: 0, ubo_off: 0,
             dummy_tex: HashMap::new(), dummy_smp: None, dummy_cmp: None, dummy_bufs: HashMap::new(), zero_vb: None, zero_src: None, scratch: None,
-            proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), f2d_pipeline: None, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
+            proxy_pipelines: HashMap::new(), unfilt: HashMap::new(), nearest: HashMap::new(), f2d_pipeline: None, bc1_astc: None, astc_jobs: Vec::new(), astc_src: Vec::new(), astc_dst_bytes: 0, astc_blocks: 0, astc_pending: Default::default(), astc_in_encoder: 0, blit: None, mip_pipelines: HashMap::new(), mip_sampler: None,
             occlusion_set: None, occlusion_next: 0, occlusion_active: None, occlusion_pass_slot: None,
             pending_resolve: Vec::new(), pending_events: Vec::new(), pending_maps: Vec::new(), counter_src: None, counter_slot: 0,
             frame_slot_done: (0..FRAME_SLOTS).map(|_| None).collect(), last_submit: None, vb_avail: [0; 16],
@@ -962,10 +1010,10 @@ impl Gpu {
     }
 
     fn obj(&self, id: u32) -> Option<&Obj> {
-        self.objs.get(id as usize).and_then(|o| o.as_ref())
+        self.objs.get(id as usize).and_then(|o| o.as_deref())
     }
     fn obj_mut(&mut self, id: u32) -> Option<&mut Obj> {
-        self.objs.get_mut(id as usize).and_then(|o| o.as_mut())
+        self.objs.get_mut(id as usize).and_then(|o| o.as_deref_mut())
     }
     fn set_obj(&mut self, id: u32, o: Obj) {
         let i = id as usize;
@@ -976,7 +1024,7 @@ impl Gpu {
         if self.objs.len() <= i {
             self.objs.resize_with(i + 1, || None);
         }
-        self.objs[i] = Some(o);
+        self.objs[i] = Some(Box::new(o));
     }
     fn tex(&self, id: u32) -> Option<&Tex> {
         match self.obj(id) { Some(Obj::Tex(t)) => Some(t), _ => None }
@@ -1046,6 +1094,8 @@ impl Gpu {
         }
     }
     fn flush(&mut self) {
+        self.flush_astc();
+        self.astc_in_encoder = 0;
         self.end_pass();
         self.flush_uniforms();
         let resolves = if self.pending_resolve.is_empty() { None } else { self.record_resolves() };
@@ -1073,6 +1123,7 @@ impl Gpu {
                 while SUSPENDED.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(50)); }
             }
             self.process_maps(false);
+            self.apply_query_results();
             if self.inflight.load(Ordering::SeqCst) > 0 {
                 let _ = self.device.poll(PollType::Poll);
             }
@@ -1253,14 +1304,16 @@ impl Gpu {
     }
 
     fn destroy(&mut self, id: u32) {
+        if self.astc_pending.contains(&id) { self.flush_astc(); }
         self.pending_clears.remove(&id);
         if self.is_bound(id) { self.pdirty = true; }
         if self.obj(id).is_none() { return; }
         if self.used(id) { self.flush(); }
         if let Some(o) = self.objs.get_mut(id as usize).and_then(|o| o.take()) {
-            match o {
-                Obj::Tex(t) => t.tex.destroy(),
+            match *o {
+                Obj::Tex(t) => { self.bc_live.remove(&id); t.tex.destroy(); }
                 Obj::Buf(b) => { if let Some(g) = b.gpu { g.destroy(); } }
+                Obj::Query(q) => { self.live_queries.remove(&q.addr); }
                 _ => {}
             }
         }
@@ -1292,16 +1345,40 @@ impl Gpu {
         let allowed = self.adapter.get_texture_format_features(m.format).allowed_usages;
         usage &= allowed | TextureUsages::COPY_SRC | TextureUsages::COPY_DST;
         let dimension = match dim { 3 => TextureDimension::D3, 1 => TextureDimension::D1, _ => TextureDimension::D2 };
+        let astc = BC1_ASTC.load(Ordering::Relaxed) && matches!(m.bc, Some(TextureFormat::Bc1RgbaUnorm | TextureFormat::Bc1RgbaUnormSrgb))
+            && dimension == TextureDimension::D2 && samples == 1 && w % 4 == 0 && h % 4 == 0 && bind & (BIND_RT | BIND_DS | BIND_UAV) == 0;
+        if astc {
+            let srgb = m.bc == Some(TextureFormat::Bc1RgbaUnormSrgb);
+            let (lin, gam) = (TextureFormat::Astc { block: AstcBlock::B4x4, channel: AstcChannel::Unorm }, TextureFormat::Astc { block: AstcBlock::B4x4, channel: AstcChannel::UnormSrgb });
+            m.format = if srgb { gam } else { lin };
+            if !m.views.is_empty() { m.views = vec![if srgb { lin } else { gam }]; }
+            usage &= TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC | TextureUsages::COPY_DST;
+        }
+        let skip = u32::from(!astc && m.bc.is_some() && dimension == TextureDimension::D2 && samples == 1 && mips >= 2
+            && bind & (BIND_RT | BIND_DS | BIND_UAV) == 0 && w.min(h) >= 512 && std::env::var_os("MUGUET_FULL_MIPS").is_none());
+        let (w, h, mips) = (w >> skip, h >> skip, mips - skip);
         let size = Extent3d { width: w.max(1), height: if dim == 1 { 1 } else { h.max(1) }, depth_or_array_layers: if dim == 3 { d.max(1) } else { array.max(1) } };
         let views = m.views.clone();
         let desc = TextureDescriptor {
             label: None, size, mip_level_count: mips.max(1), sample_count: samples, dimension, format: m.format, usage, view_formats: &views,
         };
+        let bc_src = m.bc.or(if is_bc(m.format) { Some(m.format) } else { None }).map(|f| f.remove_srgb_suffix());
+        if let Some(f) = bc_src {
+            let (layers, mut packed, mut expanded) = (size.depth_or_array_layers as u64, 0u64, 0u64);
+            let bb = f.block_copy_size(None).unwrap_or(16) as u64;
+            let px = if m.bc.is_some() { m.format.block_copy_size(None).unwrap_or(4) as u64 } else { 0 };
+            for k in 0..mips.max(1) {
+                let (mw, mh) = ((size.width >> k).max(1) as u64, (size.height >> k).max(1) as u64);
+                packed += mw.div_ceil(4) * mh.div_ceil(4) * bb * layers;
+                expanded += if astc { mw.div_ceil(4) * mh.div_ceil(4) * 16 * layers } else { mw * mh * px * layers };
+            }
+            self.bc_live.insert(id, (f, packed, expanded));
+        }
         let tex = match self.scoped(&format!("createTexture id={id} dim={dim} {}x{}x{} mips={mips} dxgi={dxgi} bind=0x{bind:x} samples={samples} -> {:?} usage {:?}", size.width, size.height, size.depth_or_array_layers, m.format, usage), |d| d.create_texture(&desc)) { Some(t) => t, None => return };
         self.set_obj(id, Obj::Tex(Tex {
-            tex, desc: TexDesc { w: size.width, h: size.height, d: size.depth_or_array_layers, mips: mips.max(1), samples, dim: dimension },
+            tex, desc: TexDesc { w: size.width, h: size.height, d: size.depth_or_array_layers, mips: mips.max(1), samples, dim: dimension, skip },
             format: m.format, views: HashMap::new(), a8: m.a8, bc: m.bc, half, enc: 0, in_bg: false, proxy_depth: None, proxy_stencil: None,
-            proxy_fdepth: None, proxy_half: None, blit_bg: None, mip_passes: None,
+            proxy_fdepth: None, proxy_half: None, blit_bg: None, mip_passes: None, astc,
         }));
     }
 
@@ -1347,10 +1424,17 @@ impl Gpu {
         if self.pending_clears.contains_key(&id) { self.materialize_clears(id); self.flush(); }
         if self.used(id) { self.flush(); }
         let t = self.tex_mut(id).unwrap();
+        if mip < t.desc.skip { return; }
+        let mip = mip - t.desc.skip;
         if let Some(p) = t.proxy_fdepth.as_mut() { p.dirty = true; }
         if let Some(p) = t.proxy_half.as_mut() { p.dirty = true; }
         let three = t.desc.dim == TextureDimension::D3;
-        let (tex, a8, bc, half) = (t.tex.clone(), t.a8, t.bc, t.half);
+        let (tex, a8, bc, half, astc) = (t.tex.clone(), t.a8, t.bc, t.half, t.astc);
+        if astc {
+            let origin = Origin3d { x, y, z: if three { z } else { slice } };
+            self.upload_bc1_astc(id, tex, mip, origin, w, h, d.max(1), bpr, rows.max(1), data_addr, size);
+            return;
+        }
         let mut data = self.bytes(data_addr, size).to_vec();
         let (mut bpr, mut rows, mut w, mut h) = (bpr, rows, w, h);
         if let Some(bc) = bc {
@@ -1392,6 +1476,86 @@ impl Gpu {
             TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(rows.max(1)) },
             Extent3d { width: w, height: h, depth_or_array_layers: d.max(1) },
         );
+    }
+
+    const ASTC_BATCH_JOBS: usize = 1024;
+    const ASTC_BATCH_BYTES: usize = 32 << 20;
+    const ASTC_JOBS_PER_SUBMIT: u32 = 4096;
+
+    fn upload_bc1_astc(&mut self, id: u32, tex: Texture, mip: u32, origin: Origin3d, w: u32, h: u32, layers: u32, bpr: u32, rows: u32, data_addr: u64, size: u64) {
+        let m = tex.size().mip_level_size(mip, tex.dimension());
+        let (w, h) = (w.min(m.width.saturating_sub(origin.x)), h.min(m.height.saturating_sub(origin.y)));
+        if w == 0 || h == 0 { return; }
+        if origin.x % 4 != 0 || origin.y % 4 != 0 { log_once("astcorigin", "BC1 upload not on a block boundary: skipped"); return; }
+        let (bx, by) = (w.div_ceil(4), h.div_ceil(4));
+        let row = (bx * 8) as usize;
+        let src_word = (self.astc_src.len() / 4) as u32;
+        let base = self.astc_src.len();
+        self.astc_src.resize(base + row * (by * layers) as usize, 0);
+        let data: &[u8] = unsafe { std::slice::from_raw_parts(self.base.add(data_addr as usize), size as usize) };
+        for z in 0..layers {
+            for r in 0..by {
+                let from = ((z * rows + r) * bpr) as usize;
+                let to = base + ((z * by + r) as usize) * row;
+                if let Some(src) = data.get(from..from + row) { self.astc_src[to..to + row].copy_from_slice(src); }
+            }
+        }
+        let dst_row = (bx * 16).div_ceil(256) * 256;
+        let dst_byte = self.astc_dst_bytes;
+        self.astc_dst_bytes += (dst_row * by * layers) as u64;
+        let first_block = self.astc_blocks;
+        self.astc_blocks += bx * by * layers;
+        self.astc_jobs.push(AstcJob { tex_id: id, tex, mip, origin, bx, by, layers, dst_row, src_word, dst_byte, first_block });
+        self.astc_pending.insert(id);
+        if self.astc_jobs.len() >= Self::ASTC_BATCH_JOBS || self.astc_src.len() >= Self::ASTC_BATCH_BYTES {
+            self.flush_astc();
+            if self.astc_in_encoder >= Self::ASTC_JOBS_PER_SUBMIT { self.flush(); }
+        }
+    }
+
+    fn flush_astc(&mut self) {
+        if self.astc_jobs.is_empty() { return; }
+        let jobs = std::mem::take(&mut self.astc_jobs);
+        let mut src = std::mem::take(&mut self.astc_src);
+        src.resize(src.len().div_ceil(4) * 4, 0);
+        let (dst_bytes, blocks) = (self.astc_dst_bytes, self.astc_blocks);
+        self.astc_dst_bytes = 0;
+        self.astc_blocks = 0;
+        self.astc_pending.clear();
+        if self.bc1_astc.is_none() {
+            let module = self.device.create_shader_module(ShaderModuleDescriptor { label: Some("bc1_astc"), source: ShaderSource::Wgsl(include_str!("bc1_astc.wgsl").into()) });
+            self.bc1_astc = Some(self.device.create_compute_pipeline(&ComputePipelineDescriptor { label: Some("bc1_astc"), layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None }));
+        }
+        let pipe = self.bc1_astc.clone().unwrap();
+        let table: Vec<u8> = jobs.iter().flat_map(|j| [j.first_block, j.bx, j.by, j.layers, j.src_word, (j.dst_byte / 4) as u32, j.dst_row / 4, 0]).flat_map(|v| v.to_le_bytes()).collect();
+        let src_buf = self.device.create_buffer_init(&util::BufferInitDescriptor { label: Some("bc1 blocks"), contents: &src, usage: BufferUsages::STORAGE });
+        let dst_buf = self.device.create_buffer(&BufferDescriptor { label: Some("astc blocks"), size: dst_bytes.max(16), usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let job_buf = self.device.create_buffer_init(&util::BufferInitDescriptor { label: Some("astc jobs"), contents: &table, usage: BufferUsages::STORAGE });
+        let bg = self.device.create_bind_group(&BindGroupDescriptor { label: None, layout: &pipe.get_bind_group_layout(0), entries: &[
+            BindGroupEntry { binding: 0, resource: src_buf.as_entire_binding() },
+            BindGroupEntry { binding: 1, resource: dst_buf.as_entire_binding() },
+            BindGroupEntry { binding: 2, resource: job_buf.as_entire_binding() },
+        ] });
+        let groups = blocks.div_ceil(64);
+        let gx = groups.min(65535);
+        let gy = groups.div_ceil(gx);
+        self.end_pass();
+        let enc = self.encoder();
+        {
+            let mut c = enc.begin_compute_pass(&ComputePassDescriptor::default());
+            c.set_pipeline(&pipe);
+            c.set_bind_group(0, &bg, &[]);
+            c.dispatch_workgroups(gx, gy, 1);
+        }
+        for j in &jobs {
+            enc.copy_buffer_to_texture(
+                TexelCopyBufferInfo { buffer: &dst_buf, layout: TexelCopyBufferLayout { offset: j.dst_byte, bytes_per_row: Some(j.dst_row), rows_per_image: Some(j.by) } },
+                TexelCopyTextureInfo { texture: &j.tex, mip_level: j.mip, origin: j.origin, aspect: TextureAspect::All },
+                Extent3d { width: j.bx * 4, height: j.by * 4, depth_or_array_layers: j.layers },
+            );
+        }
+        for j in &jobs { self.use_tex(j.tex_id); }
+        self.astc_in_encoder += jobs.len() as u32;
     }
 
     fn create_shader(&mut self, p: u64) {
@@ -1480,6 +1644,10 @@ impl Gpu {
     }
 
     fn load_program(&mut self, hash: &str, stage: u32) -> Option<Rc<Program>> {
+        self.load_map_program(hash, stage, false)
+    }
+
+    fn load_map_program(&mut self, hash: &str, stage: u32, pause: bool) -> Option<Rc<Program>> {
         let rec = self.shader_index.get(hash).cloned();
         let ok = rec.as_ref().and_then(|r| r.get("ok")).and_then(|v| v.as_bool()).unwrap_or(false);
         let label = rec.as_ref().map(|r| format!("{}::{}", r["effect"].as_str().unwrap_or("?"), r["program"].as_str().unwrap_or("?"))).unwrap_or_else(|| hash.to_string());
@@ -1490,6 +1658,13 @@ impl Gpu {
         let source = match std::fs::read_to_string(self.shader_dir.join(format!("{hash}.wgsl"))) {
             Ok(s) => s,
             Err(e) => { log_once(&format!("nosrc{hash}"), &format!("shader source {hash}: {e}")); return None; }
+        };
+        // These translated shaders need the same compatibility corrections as
+        // the WebGPU renderer. Parse bindings only after replacing the source.
+        let source = match label.as_str() {
+            "im::PS_BlitDepthToAlpha" if !pause => include_str!("minimap_alpha.wgsl").to_string(),
+            "radar::PS_TexturedUnlitAA" => radar_compat(&source)?,
+            _ => source,
         };
         let (text, pack) = pack_uniforms(&source);
         let module = self.scoped(&format!("shader {label}"), |d| d.create_shader_module(ShaderModuleDescriptor { label: Some(&label), source: ShaderSource::Wgsl(text.as_str().into()) }))?;
@@ -1552,11 +1727,17 @@ impl Gpu {
         Some((map, pairs.join(","), ps_hit))
     }
 
-    fn vertex_module(&self, vs: &Program, flat: &[u32], remap: Option<&(HashMap<u32, u32>, String, bool)>) -> Option<ShaderModule> {
-        if flat.is_empty() && remap.is_none() { return Some(vs.module.clone()); }
+    fn vertex_module(&self, vs: &Program, flat: &[u32], remap: Option<&(HashMap<u32, u32>, String, bool)>, minimap: bool) -> Option<ShaderModule> {
+        if minimap && !vs.text.contains("o0 = vec4<f32>(v0.xyz, o0.w);") {
+            log_once("minimap_vertex", "unexpected minimap vertex shader; skipping mask");
+            return None;
+        }
+        if !minimap && flat.is_empty() && remap.is_none() { return Some(vs.module.clone()); }
         let key = format!("flat {}{}", flat.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","), remap.map(|r| format!("|{}", r.1)).unwrap_or_default());
+        let key = format!("{key}{}", if minimap { "|minimap" } else { "" });
         self.variant(vs, &key, |text| {
-            let t = RE_VS_LOC_MEMBER.replace_all(text, |c: &regex::Captures| {
+            let text = if minimap { text.replace("o0 = vec4<f32>(v0.xyz, o0.w);", "o0 = vec4<f32>(v0.x * 2.0 - 1.0, 1.0 - v0.y * 2.0, v0.z, o0.w);") } else { text.to_string() };
+            let t = RE_VS_LOC_MEMBER.replace_all(&text, |c: &regex::Captures| {
                 let loc: u32 = c[1].parse().unwrap_or(0);
                 if flat.contains(&loc) { format!("@location({}u) @interpolate(flat){}", &c[1], &c[2]) } else { c[0].to_string() }
             }).into_owned();
@@ -1613,7 +1794,7 @@ impl Gpu {
 
     fn bgl_for(&mut self, prog: &Program, stage: u32, group: u32) -> (BindGroupLayout, u64) {
         let mask = self.unfilt.get(&prog.uid).copied().unwrap_or((0, 0));
-        let key = (format!("{}#{}#{:x}", prog.label, prog.uid, mask.0), stage, group);
+        let key = (prog.uid, mask.0, stage, group);
         if let Some(b) = self.bgl_cache.get(&key) { return b.clone(); }
         let entries: Vec<_> = prog.info.bindings.iter().filter(|b| b.group == group).map(|b| Self::layout_entry_masked(b, stage, mask)).collect();
         let bgl = self.device.create_bind_group_layout(&BindGroupLayoutDescriptor { label: None, entries: &entries });
@@ -1993,8 +2174,10 @@ impl Gpu {
 
     fn srv_view(&mut self, srv_id: u32, b: &Binding) -> Option<TextureView> {
         let (res, fmt, a, bb, c, d) = { let v = self.view_obj(srv_id)?; (v.res, v.fmt, v.a, v.b, v.c, v.d) };
+        if self.astc_pending.contains(&res) { self.flush_astc(); }
         let t = self.tex(res)?;
-        let (tformat, desc) = (t.format, t.desc);
+        let (tformat, desc, astc) = (t.format, t.desc, t.astc);
+        let (a, bb) = if desc.skip == 0 || bb == 0xffff_ffff || bb == 0 { (a.saturating_sub(desc.skip), bb) } else { (a.saturating_sub(desc.skip), bb.saturating_sub(desc.skip.saturating_sub(a)).max(1)) };
         let mut proxied = false;
         let (tex, format) = if is_depth(tformat) && b.sample != Sample::Depth {
             proxied = true;
@@ -2031,6 +2214,9 @@ impl Gpu {
         if fmt != 0 && !is_depth(format) && !proxied {
             let mf = map_format(fmt, 0).format;
             if mf != format && mf.is_srgb() != format.is_srgb() && mf.remove_srgb_suffix() == format.remove_srgb_suffix() { vd.format = Some(mf); }
+            if astc && mf.is_srgb() != format.is_srgb() {
+                vd.format = Some(TextureFormat::Astc { block: AstcBlock::B4x4, channel: if mf.is_srgb() { AstcChannel::UnormSrgb } else { AstcChannel::Unorm } });
+            }
         }
         if is_depth(format) && !proxied {
             vd.aspect = if fmt == 47 || fmt == 22 { TextureAspect::StencilOnly } else { TextureAspect::DepthOnly };
@@ -2083,11 +2269,18 @@ impl Gpu {
             return None;
         }
         let (ci, off) = self.uniform_alloc(pack.size);
-        let mut block = vec![0u8; pack.size as usize];
+        let end = (off + pack.size) as usize;
+        let mut stage_buf = {
+            let chunk = &mut self.ubo_slots[self.ubo_slot][ci];
+            if chunk.stage.len() < end { chunk.stage.resize((end.max(262144)).next_power_of_two().min(RING_CHUNK as usize), 0); }
+            std::mem::take(&mut chunk.stage)
+        };
+        let block = &mut stage_buf[off as usize..end];
+        block.fill(0);
         for m in &pack.members {
-            let cb = self.s.cb[stage].get(m.binding as usize).cloned().unwrap_or_default();
-            if let Some(Buf { shadow: Some(sh), size, .. }) = self.buf(cb.buf) {
-                let from = cb.first as u64 * 16;
+            let (cb_buf, cb_first) = self.s.cb[stage].get(m.binding as usize).map(|c| (c.buf, c.first)).unwrap_or_default();
+            if let Some(Buf { shadow: Some(sh), size, .. }) = self.buf(cb_buf) {
+                let from = cb_first as u64 * 16;
                 let len = m.size.min(size.saturating_sub(from));
                 if len > 0 {
                     block[m.offset as usize..(m.offset + len) as usize].copy_from_slice(&sh[from as usize..(from + len) as usize]);
@@ -2095,9 +2288,7 @@ impl Gpu {
             }
         }
         let chunk = &mut self.ubo_slots[self.ubo_slot][ci];
-        let end = (off + pack.size) as usize;
-        if chunk.stage.len() < end { chunk.stage.resize((end.max(262144)).next_power_of_two().min(RING_CHUNK as usize), 0); }
-        chunk.stage[off as usize..end].copy_from_slice(&block);
+        chunk.stage = stage_buf;
         chunk.lo = chunk.lo.min(off);
         chunk.hi = chunk.hi.max(end as u64);
         Some((ci, off))
@@ -2138,11 +2329,13 @@ impl Gpu {
 
     fn stage_bind_group(&mut self, stage: usize, prog: &Program, group: u32, bgl: &(BindGroupLayout, u64)) -> Option<BgResult> {
         enum Res { Buf(Buffer, u64, Option<u64>), View(TextureView), Smp(Sampler) }
-        let bindings = prog.group_bindings.get(&group).cloned().unwrap_or_default();
-        let mut entries: Vec<(u32, Res)> = Vec::new();
-        let mut key: Vec<u64> = vec![bgl.1, prog.uid, stage as u64];
+        let none = Vec::new();
+        let bindings = prog.group_bindings.get(&group).unwrap_or(&none);
+        let mut entries: Vec<(u32, Res)> = Vec::with_capacity(bindings.len());
+        let mut key: Vec<u64> = Vec::with_capacity(bindings.len() * 2 + 3);
+        key.extend([bgl.1, prog.uid, stage as u64]);
         let mut dyn_off = None;
-        for b in &bindings {
+        for b in bindings {
             match b.kind {
                 Kind::Uniform => {
                     if b.binding == 15 {
@@ -2311,8 +2504,16 @@ impl Gpu {
         if let Some(tx) = self.pipe_jobs.clone() {
             let id = self.uid();
             self.pipe_pending.insert(id, (key.clone(), vb_req, job.label.clone()));
-            self.pipelines.insert(key, PipeEntry::Pending);
+            self.pipelines.insert(key.clone(), PipeEntry::Pending);
             let _ = tx.send((id, job));
+            let start = Instant::now();
+            let deadline = start + self.pipe_wait_left;
+            while let Ok((done, pipeline)) = self.pipe_results.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                self.finish_pipeline(done, pipeline);
+                if done == id { break; }
+            }
+            self.pipe_wait_left = self.pipe_wait_left.saturating_sub(start.elapsed());
+            if let Some(PipeEntry::Done(p)) = self.pipelines.get(&key) { return p.clone(); }
             self.pending_skips += 1;
             return None;
         }
@@ -2329,7 +2530,7 @@ impl Gpu {
         let bgl1 = match ps { Some(p) if p.info.bindings.iter().any(|b| b.group == 1) => self.bgl_for(p, 1, 1).0, _ => self.empty_bgl() };
         let pl_layout = self.device.create_pipeline_layout(&PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl0), Some(&bgl1)], immediate_size: 0 });
         let remap = self.inter_stage_remap(vs, ps.map(|p| p.as_ref()));
-        let vmod = self.vertex_module(vs, ps.map(|p| p.flat.as_slice()).unwrap_or(&[]), remap.as_ref())?;
+        let vmod = self.vertex_module(vs, ps.map(|p| p.flat.as_slice()).unwrap_or(&[]), remap.as_ref(), vs.label == "im::VS_Blit" && ps.map(|p| p.label == "im::PS_BlitDepthToAlpha").unwrap_or(false))?;
 
         let mut by_slot: BTreeMap<u32, (Vec<VertexAttribute>, VertexStepMode)> = BTreeMap::new();
         for e in &layout.els {
@@ -2403,11 +2604,15 @@ impl Gpu {
 
     fn collect_pipelines(&mut self) {
         while let Ok((id, pipeline)) = self.pipe_results.try_recv() {
-            let Some((key, vb_req, label)) = self.pipe_pending.remove(&id) else { continue };
-            let entry = pipeline.map(|pipeline| { let uid = self.uid(); Rc::new(Pl { pipeline, uid, vb_req, label }) });
-            self.pipelines.insert(key, PipeEntry::Done(entry));
-            self.pdirty = true;
+            self.finish_pipeline(id, pipeline);
         }
+    }
+
+    fn finish_pipeline(&mut self, id: u64, pipeline: Option<RenderPipeline>) {
+        let Some((key, vb_req, label)) = self.pipe_pending.remove(&id) else { return };
+        let entry = pipeline.map(|pipeline| { let uid = self.uid(); Rc::new(Pl { pipeline, uid, vb_req, label }) });
+        self.pipelines.insert(key, PipeEntry::Done(entry));
+        self.pdirty = true;
     }
 
     fn vs_sig(&self) -> Option<Vec<SigEl>> {
@@ -2431,6 +2636,33 @@ impl Gpu {
         let ps_id = self.s.shader[1];
         let Some(vs) = self.shader_program(vs_id) else { self.skip(); return };
         let ps = if ps_id != 0 { match self.shader_program(ps_id) { Some(p) => Some(p), None => { self.skip(); return } } } else { None };
+        // Pause-map fog tiles use world coordinates and the original depth
+        // program. Keep their programs separate from the normalized HUD mask.
+        let pause = vs.label == "im::VS_Blit"
+            && ps.as_ref().map(|p| p.label == "im::PS_BlitDepthToAlpha").unwrap_or(false)
+            && self.state(self.s.blend.0).map(|b| b.words.get(2) == Some(&1)
+                && b.words.get(5) == Some(&4) && b.words.get(9) == Some(&8)).unwrap_or(false);
+        let (vs, ps) = if pause {
+            let Some(hash) = self.shader_index.iter().find(|(_, r)|
+                r.get("effect").and_then(|v| v.as_str()) == Some("im")
+                    && r.get("program").and_then(|v| v.as_str()) == Some("VS_TransformUnlit_IM"))
+                .map(|(h, _)| h.clone()) else { self.skip(); return };
+            let ps_hash = match self.obj(ps_id) { Some(Obj::Shader(s)) => s.hash.clone(), _ => { self.skip(); return } };
+            let mut programs = Vec::new();
+            for (hash, stage) in [(hash, 0), (ps_hash, 1)] {
+                let key = format!("pause:{hash}");
+                let program = match self.map_programs.get(&key) {
+                    Some(p) => p.clone(),
+                    None => {
+                        let Some(p) = self.load_map_program(&hash, stage, true) else { self.skip(); return };
+                        self.map_programs.insert(key, p.clone());
+                        p
+                    }
+                };
+                programs.push(program);
+            }
+            (programs[0].clone(), Some(programs[1].clone()))
+        } else { (vs, ps) };
         let layout = match self.obj(self.s.layout) { Some(Obj::Layout(l)) => l.clone(), _ => { self.skip(); return } };
         self.prepare_depth_proxies(&vs, 0);
         if let Some(p) = &ps { self.prepare_depth_proxies(p, 1); }
@@ -2769,10 +3001,15 @@ impl Gpu {
     }
 
     fn sub_of(desc: &TexDesc, sub: u32) -> (u32, u32) {
-        (sub % desc.mips, sub / desc.mips)
+        let mips = desc.mips + desc.skip;
+        ((sub % mips).saturating_sub(desc.skip), sub / mips)
+    }
+    fn sub_dropped(desc: &TexDesc, sub: u32) -> bool {
+        sub % (desc.mips + desc.skip) < desc.skip
     }
     #[allow(clippy::too_many_arguments)]
     fn copy_region(&mut self, dst: u32, dst_sub: u32, dx: u32, dy: u32, dz: u32, src: u32, src_sub: u32, has_box: bool, l: u32, t: u32, f: u32, r: u32, b: u32, bk: u32) {
+        if self.astc_pending.contains(&src) || self.astc_pending.contains(&dst) { self.flush_astc(); }
         self.materialize_clears(src);
         self.materialize_clears(dst);
         if self.obj(src).is_none() || self.obj(dst).is_none() { return; }
@@ -2787,6 +3024,8 @@ impl Gpu {
             return;
         }
         let (Some(s), Some(d)) = (self.tex(src), self.tex(dst)) else { return };
+        if Self::sub_dropped(&s.desc, src_sub) || Self::sub_dropped(&d.desc, dst_sub) { log_once("copyskip", "copy touches a dropped mip level: ignored"); return; }
+        if s.astc != d.astc { log_once("copyastc", "copy between an ASTC-transcoded and a plain texture: ignored"); return; }
         let (ss, ds) = (Self::sub_of(&s.desc, src_sub), Self::sub_of(&d.desc, dst_sub));
         let (mw, mh, md) = ((s.desc.w >> ss.0).max(1), (s.desc.h >> ss.0).max(1), if s.desc.dim == TextureDimension::D3 { (s.desc.d >> ss.0).max(1) } else { 1 });
         let (w, h, dep) = if has_box { (r - l, b - t, bk - f) } else { (mw, mh, md) };
@@ -2828,11 +3067,14 @@ impl Gpu {
         self.use_tex(dst);
     }
     fn copy_resource(&mut self, dst: u32, src: u32) {
+        if self.astc_pending.contains(&src) || self.astc_pending.contains(&dst) { self.flush_astc(); }
         self.materialize_clears(src);
         self.materialize_clears(dst);
         if self.buf(src).is_some() { self.copy_region(dst, 0, 0, 0, 0, src, 0, false, 0, 0, 0, 0, 0, 0); return; }
         let (Some(s), Some(d)) = (self.tex(src), self.tex(dst)) else { return };
         let (stex, dtex, sd, dd) = (s.tex.clone(), d.tex.clone(), s.desc, d.desc);
+        if sd.skip != dd.skip { log_once("copyresskip", "CopyResource between textures with different dropped mips: ignored"); return; }
+        if s.astc != d.astc { log_once("copyresastc", "CopyResource between an ASTC-transcoded and a plain texture: ignored"); return; }
         self.end_pass();
         let enc = self.encoder();
         for mip in 0..sd.mips.min(dd.mips) {
@@ -2943,9 +3185,15 @@ impl Gpu {
             self.map_pending(rb, MapKind::Readback { flag, rows: vec![(0, addr, n)] });
             return;
         }
-        let Some((tex, fmt, desc)) = self.tex(src).map(|x| (x.tex.clone(), x.format, x.desc)) else { done(self); return };
+        let Some((tex, fmt, desc, bc)) = self.tex(src).map(|x| (x.tex.clone(), x.format, x.desc, x.bc)) else { done(self); return };
+        if let Some(bc) = bc {
+            log_once(&format!("rbbc{bc:?}"), &format!("readback of a software-decoded {bc:?} texture: skipped"));
+            done(self);
+            return;
+        }
         if desc.samples > 1 || is_depth(fmt) { log_once(&format!("rbfmt{fmt:?}"), &format!("readback of {fmt:?} not supported")); done(self); return; }
-        let (mip, layer) = (sub % desc.mips, sub / desc.mips);
+        if Self::sub_dropped(&desc, sub) { done(self); return; }
+        let (mip, layer) = Self::sub_of(&desc, sub);
         let (mw, mh) = ((desc.w >> mip).max(1), (desc.h >> mip).max(1));
         let three = desc.dim == TextureDimension::D3;
         let md = if three { (desc.d >> mip).max(1) } else { 1 };
@@ -2965,12 +3213,17 @@ impl Gpu {
             Extent3d { width: bx * bw, height: by * bh, depth_or_array_layers: if three { d } else { 1 } },
         );
         self.flush();
+        let row_len = if row_pitch != 0 { row_bytes.min(row_pitch) } else { row_bytes };
+        let end = if size != 0 { addr + size } else { u64::MAX };
         let mut rows = Vec::new();
         for z in 0..d as u64 {
             for row in 0..by as u64 {
-                rows.push(((z * by as u64 + row) * bpr, addr + z * slice_pitch + row * row_pitch, row_bytes));
+                let to = addr + z * slice_pitch + row * row_pitch;
+                if to >= end { break; }
+                rows.push(((z * by as u64 + row) * bpr, to, row_len.min(end - to)));
             }
         }
+        if row_len < row_bytes { log_once(&format!("rbpitch{fmt:?}"), &format!("readback rows of {row_bytes} bytes clamped to the game's pitch {row_pitch} ({fmt:?})")); }
         self.map_pending(rb, MapKind::Readback { flag, rows });
     }
 
@@ -2994,6 +3247,7 @@ impl Gpu {
                     MapKind::Readback { rows, .. } => {
                         for &(from, to, n) in rows {
                             let n = n.min(range.len() as u64 - from.min(range.len() as u64));
+                            crate::heapcheck::note(to, n, "gpu readback");
                             unsafe { std::ptr::copy_nonoverlapping(range.as_ptr().add(from as usize), self.base.add(to as usize), n as usize); }
                         }
                     }
@@ -3016,13 +3270,20 @@ impl Gpu {
         }
     }
 
-    fn query_store(&self, addr: u64, result: u64, seq: u32) {
+    fn query_store(&mut self, addr: u64, result: u64, seq: u32) {
+        if !self.live_queries.contains(&addr) {
+            self.stale_query_writes += 1;
+            log(&format!("skipped a GPU query result for a deleted query at 0x{addr:x} (total {})", self.stale_query_writes));
+            return;
+        }
+        crate::heapcheck::note(addr, 16, "gpu query result");
         atomic(&self.mem, addr + 8).store(result as u32 as i32, Ordering::SeqCst);
         atomic(&self.mem, addr + 12).store((result >> 32) as u32 as i32, Ordering::SeqCst);
         atomic(&self.mem, addr).store(seq as i32, Ordering::SeqCst);
         let _ = self.mem.atomic_notify(addr, u32::MAX);
     }
     fn create_query(&mut self, id: u32, qtype: u32, addr: u64) {
+        self.live_queries.insert(addr);
         self.set_obj(id, Obj::Query(QueryObj { qtype, addr, slots: vec![] }));
         if self.occlusion_set.is_none() {
             self.occlusion_set = Some(self.device.create_query_set(&QuerySetDescriptor { label: None, ty: QueryType::Occlusion, count: OCCLUSION_CAPACITY }));
@@ -3092,6 +3353,10 @@ impl Gpu {
         let done = Arc::new(AtomicBool::new(false));
         Some(PendingMap { buf: map, done, kind: MapKind::Occlusion { list: out } })
     }
+    fn apply_query_results(&mut self) {
+        let done = std::mem::take(&mut *self.query_done.lock().unwrap());
+        for (addr, v, seq) in done { self.query_store(addr, v, seq); }
+    }
     fn on_submitted(&mut self) {
         let unmapped: Vec<usize> = self.pending_maps.iter().enumerate().filter(|(_, m)| matches!(m.kind, MapKind::Occlusion { .. }) && !m.done.load(Ordering::SeqCst)).map(|(i, _)| i).collect();
         let _ = unmapped;
@@ -3101,14 +3366,12 @@ impl Gpu {
             let inflight = self.inflight.clone();
             inflight.fetch_add(1, Ordering::SeqCst);
             let addrs: Vec<(u64, u64, u32)> = evs.iter().filter_map(|(id, seq, v)| match self.obj(*id) { Some(Obj::Query(q)) => Some((q.addr, *v, *seq)), _ => None }).collect();
+            let results = self.query_done.clone();
+            let ring = self.ring;
             self.queue.on_submitted_work_done(move || {
-                for (addr, v, seq) in addrs {
-                    atomic(&mem, addr + 8).store(v as u32 as i32, Ordering::SeqCst);
-                    atomic(&mem, addr + 12).store((v >> 32) as u32 as i32, Ordering::SeqCst);
-                    atomic(&mem, addr).store(seq as i32, Ordering::SeqCst);
-                    let _ = mem.atomic_notify(addr, u32::MAX);
-                }
+                results.lock().unwrap().extend(addrs);
                 inflight.fetch_sub(1, Ordering::SeqCst);
+                let _ = mem.atomic_notify(ring, u32::MAX);
             });
         }
     }
@@ -3208,6 +3471,7 @@ impl Gpu {
         }
         self.collect_pipelines();
         self.presents += 1;
+        self.pipe_wait_left = PIPELINE_WAIT;
         PRESENTS.store(self.presents, Ordering::Relaxed);
         self.log_fps();
 
@@ -3226,17 +3490,29 @@ impl Gpu {
         let dt = now.duration_since(self.fps_t0).as_secs_f64();
         if dt >= 10.0 {
             let frames = self.presents - self.fps_n0;
+            let resident = if *MEM_STATS { format!(" ({} MB resident)", crate::heap_resident_mb()) } else { String::new() };
+            let malloc = if *MEM_STATS { format!(", malloc {} MB", crate::malloc_mb()) } else { String::new() };
             log(&format!(
-                "fps: {:.1} ({} MB memory, game heap {} MB, {} frames, {} clears folded, {} draws/frame, {} draws waiting for a compiling pipeline, {:.1} submits/frame, {:.1} passes/frame, {} skipped total, pipelines {}, bind groups cached {}, validation errors {})",
-                frames as f64 / dt, crate::footprint_mb(), crate::RT.get().map(|r| r.mem.data_size() >> 20).unwrap_or(0), frames, self.clears_folded, (self.draws - self.fps_d0) / frames.max(1), self.pending_skips - self.pending_skips0, (self.submits - self.submits0) as f64 / frames.max(1) as f64,
+                "fps: {:.1} ({} MB memory, game heap {} MB{resident}, gpu {} MB, compressed {} MB{malloc}, {} frames, {} clears folded, {} draws/frame, {} draws waiting for a compiling pipeline, {:.1} submits/frame, {:.1} passes/frame, {} skipped total, pipelines {}, bind groups cached {}, validation errors {})",
+                frames as f64 / dt, crate::footprint_mb(), crate::RT.get().map(|r| r.mem.data_size() >> 20).unwrap_or(0), crate::gpu_allocated_mb(), crate::compressed_mb(), frames, self.clears_folded, (self.draws - self.fps_d0) / frames.max(1), self.pending_skips - self.pending_skips0, (self.submits - self.submits0) as f64 / frames.max(1) as f64,
                 (self.passes - self.passes0) as f64 / frames.max(1) as f64, self.skipped, self.pipe_creates, self.bind_groups.len(), self.errors.load(Ordering::Relaxed)
             ));
-            if let Some(r) = self.instance.generate_report() {
+            if *MEM_STATS {
+                let mut by: Vec<(TextureFormat, u64, u64, u64)> = Vec::new();
+                for (f, p, e) in self.bc_live.values() {
+                    match by.iter_mut().find(|x| x.0 == *f) { Some(x) => { x.1 += 1; x.2 += p; x.3 += e; } None => by.push((*f, 1, *p, *e)) }
+                }
+                by.sort_by_key(|x| std::cmp::Reverse(x.2));
+                let parts: Vec<String> = by.iter().map(|(f, n, p, e)| format!("{f:?} {n} tex {} MB{}", p >> 20, if *e > 0 { format!(" (expanded {} MB)", e >> 20) } else { String::new() })).collect();
+                log(&format!("bc textures: {}", parts.join(", ")));
+            }
+            let report = if *MEM_STATS { self.instance.generate_report() } else { None };
+            if let Some(r) = report {
                 let h = &r.hub;
-                log(&format!("live wgpu objects: buffers {} textures {} views {} bind groups {} samplers {} pipelines {} | engine objects {}",
+                log(&format!("live wgpu objects: buffers {} textures {} views {} bind groups {} samplers {} pipelines {} | engine objects {} (slots {})",
                     h.buffers.num_kept_from_user, h.textures.num_kept_from_user, h.texture_views.num_kept_from_user,
                     h.bind_groups.num_kept_from_user, h.samplers.num_kept_from_user, h.render_pipelines.num_kept_from_user,
-                    self.objs.iter().filter(|o| o.is_some()).count()));
+                    self.objs.iter().filter(|o| o.is_some()).count(), self.objs.len()));
             }
             self.submits0 = self.submits;
             self.pending_skips0 = self.pending_skips;
@@ -3283,4 +3559,18 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         cur = c.source();
     }
     s
+}
+
+// WebGPU has no geometry stage to provide radar edge distances at location 5.
+// Retain texture/depth/clipping and use full edge coverage instead.
+fn radar_compat(source: &str) -> Option<String> {
+    let text = source.replace(", v5 : vec4<f32>", "")
+        .replace(", @location(5u) v5 : vec4<f32>", "")
+        .replace(", v3, v5);", ", v3);");
+    let edge = Regex::new(r"r0\.y = min\(v5\.y, v5\.x\);\s*r0\.y = clamp\(min\(r0\.yyyy, v5\.xyz\.zzzz\)\.y, 0\.0f, 1\.0f\);").unwrap();
+    let text = edge.replace(&text, "r0.y = 1.0f;").into_owned();
+    if Regex::new(r"\bv5\b").unwrap().is_match(&text) {
+        log_once("radar_compat", "unexpected radar edge input; skipping incompatible shader");
+        None
+    } else { Some(text) }
 }
